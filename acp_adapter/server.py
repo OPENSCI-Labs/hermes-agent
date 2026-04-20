@@ -246,33 +246,49 @@ class HermesACPAgent(acp.Agent):
         state: SessionState,
         mcp_servers: list[McpServerStdio | McpServerHttp | McpServerSse] | None,
     ) -> None:
-        """Register ACP-provided MCP servers and refresh the agent tool surface."""
-        if not mcp_servers:
-            return
+        """Register MCP servers and refresh the agent tool surface.
 
+        Sources, in order:
+          1. ACP client-provided `mcp_servers` (protocol-standard path).
+          2. Fallback: `mcp_servers` from the hermes config file — covers ACP
+             clients that haven't been updated to forward the config yet.
+        """
         try:
             from tools.mcp_tool import register_mcp_servers
 
             config_map: dict[str, dict] = {}
-            for server in mcp_servers:
-                name = server.name
-                if isinstance(server, McpServerStdio):
-                    config = {
-                        "command": server.command,
-                        "args": list(server.args),
-                        "env": {item.name: item.value for item in server.env},
-                    }
-                else:
-                    config = {
-                        "url": server.url,
-                        "headers": {item.name: item.value for item in server.headers},
-                    }
-                config_map[name] = config
+            if mcp_servers:
+                for server in mcp_servers:
+                    name = server.name
+                    if isinstance(server, McpServerStdio):
+                        config = {
+                            "command": server.command,
+                            "args": list(server.args),
+                            "env": {item.name: item.value for item in server.env},
+                        }
+                    else:
+                        config = {
+                            "url": server.url,
+                            "headers": {item.name: item.value for item in server.headers},
+                        }
+                    config_map[name] = config
+            else:
+                from tools.mcp_tool import _load_mcp_config
+                config_map = _load_mcp_config()
+                if config_map:
+                    logger.info(
+                        "Session %s: ACP client sent no mcp_servers — falling back to config file (%d entries)",
+                        state.session_id,
+                        len(config_map),
+                    )
+
+            if not config_map:
+                return
 
             await asyncio.to_thread(register_mcp_servers, config_map)
         except Exception:
             logger.warning(
-                "Session %s: failed to register ACP MCP servers",
+                "Session %s: failed to register MCP servers",
                 state.session_id,
                 exc_info=True,
             )
@@ -281,7 +297,19 @@ class HermesACPAgent(acp.Agent):
         try:
             from model_tools import get_tool_definitions
 
-            enabled_toolsets = getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
+            enabled_toolsets = list(
+                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
+            )
+            # Include each MCP server's `mcp-<name>` toolset so the tools
+            # actually reach the model. `register_mcp_servers` places tools
+            # under that toolset name (see tools/mcp_tool.py::_register_server_tools),
+            # and the base `hermes-acp` toolset does NOT pull them in.
+            for server_name in config_map.keys():
+                toolset_name = f"mcp-{server_name}"
+                if toolset_name not in enabled_toolsets:
+                    enabled_toolsets.append(toolset_name)
+            state.agent.enabled_toolsets = enabled_toolsets
+
             disabled_toolsets = getattr(state.agent, "disabled_toolsets", None)
             state.agent.tools = get_tool_definitions(
                 enabled_toolsets=enabled_toolsets,
@@ -295,13 +323,14 @@ class HermesACPAgent(acp.Agent):
             if callable(invalidate):
                 invalidate()
             logger.info(
-                "Session %s: refreshed tool surface after ACP MCP registration (%d tools)",
+                "Session %s: refreshed tool surface after MCP registration (%d tools, toolsets=%s)",
                 state.session_id,
                 len(state.agent.tools or []),
+                enabled_toolsets,
             )
         except Exception:
             logger.warning(
-                "Session %s: failed to refresh tool surface after ACP MCP registration",
+                "Session %s: failed to refresh tool surface after MCP registration",
                 state.session_id,
                 exc_info=True,
             )

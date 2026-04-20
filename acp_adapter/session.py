@@ -117,6 +117,67 @@ def _clear_task_cwd(task_id: str) -> None:
         logger.debug("Failed to clear ACP task cwd override", exc_info=True)
 
 
+def _register_mcp_for_restored_session(state: "SessionState") -> None:
+    """Register MCP servers from config.yaml and refresh the agent toolset.
+
+    When the ACP adapter restores a session from the database (e.g. after a
+    client reconnect without an explicit `session/load`), the recreated agent
+    is initialized with `enabled_toolsets=["hermes-acp"]` and no MCP tools.
+    Without this hook, tools defined in `~/.hermes/config.yaml::mcp_servers`
+    are invisible to the model on the first prompt after restart. Mirrors the
+    registration path used for fresh/loaded sessions in `server.py`.
+    """
+    try:
+        from tools.mcp_tool import _load_mcp_config, register_mcp_servers
+        config_map = _load_mcp_config()
+        if not config_map:
+            return
+        register_mcp_servers(config_map)
+    except Exception:
+        logger.debug(
+            "Restored session %s: MCP registration skipped",
+            state.session_id,
+            exc_info=True,
+        )
+        return
+
+    try:
+        from model_tools import get_tool_definitions
+        enabled_toolsets = list(
+            getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
+        )
+        for server_name in config_map.keys():
+            toolset_name = f"mcp-{server_name}"
+            if toolset_name not in enabled_toolsets:
+                enabled_toolsets.append(toolset_name)
+        state.agent.enabled_toolsets = enabled_toolsets
+
+        disabled_toolsets = getattr(state.agent, "disabled_toolsets", None)
+        state.agent.tools = get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=True,
+        )
+        state.agent.valid_tool_names = {
+            tool["function"]["name"] for tool in state.agent.tools or []
+        }
+        invalidate = getattr(state.agent, "_invalidate_system_prompt", None)
+        if callable(invalidate):
+            invalidate()
+        logger.info(
+            "Restored session %s: MCP tool surface refreshed (%d tools, toolsets=%s)",
+            state.session_id,
+            len(state.agent.tools or []),
+            enabled_toolsets,
+        )
+    except Exception:
+        logger.debug(
+            "Restored session %s: failed to refresh tool surface",
+            state.session_id,
+            exc_info=True,
+        )
+
+
 @dataclass
 class SessionState:
     """Tracks per-session state for an ACP-managed Hermes agent."""
@@ -494,6 +555,7 @@ class SessionManager:
         with self._lock:
             self._sessions[session_id] = state
         _register_task_cwd(session_id, cwd)
+        _register_mcp_for_restored_session(state)
         logger.info("Restored ACP session %s from DB (%d messages)", session_id, len(history))
         return state
 
